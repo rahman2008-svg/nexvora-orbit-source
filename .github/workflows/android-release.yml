@@ -1,218 +1,146 @@
 
-name: NexVora ORBIT Android Binary Release
+name: NexVora ORBIT CI
 
 on:
-  release:
-    types: [published]
+  push:
+    branches:
+      - main
+
+  pull_request:
 
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Release tag (default: CACTUS_VERSION)"
-        required: false
-        type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: orbit-android-release-${{ github.ref }}
-  cancel-in-progress: false
+  group: orbit-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  transpile:
-    name: Transpile Android Model Bundles
-    runs-on: ubuntu-24.04-arm
+
+  # ------------------------------------------
+  # JOB 1: FORMAT, ANALYZE AND TEST
+  # ------------------------------------------
+
+  test:
+    name: Format, Analyze and Test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    defaults:
+      run:
+        working-directory: flutter/example
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter and Dart
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+          pub-cache: true
+
+      - name: Show Flutter and Dart versions
+        run: |
+          flutter --version
+          dart --version
+
+      - name: Install system SQLite dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+        working-directory: .
+
+      - name: Get Flutter dependencies
+        run: flutter pub get
+
+      # Format source automatically in GitHub Runner.
+      # No Dart installation is required on the user's phone.
+      - name: Format ORBIT Dart source
+        run: |
+          dart format lib/orbit test/orbit_actions_test.dart
+
+      - name: Analyze Flutter project
+        run: flutter analyze
+
+      - name: Run Flutter unit tests
+        run: flutter test
+
+  # ------------------------------------------
+  # JOB 2: BUILD ANDROID DEBUG APK
+  # ------------------------------------------
+
+  apk-debug:
+    name: Build NexVora ORBIT ARM64 Debug APK
+    needs: test
+
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
 
     steps:
-      - name: Checkout source
+
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Resolve release tag
-        id: tag
-        env:
-          EVENT_TAG: ${{ github.event.release.tag_name }}
-          INPUT_TAG: ${{ github.event.inputs.tag }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ -n "${EVENT_TAG:-}" ]; then
-            TAG="$EVENT_TAG"
-          elif [ -n "${INPUT_TAG:-}" ]; then
-            TAG="$INPUT_TAG"
-          else
-            test -f CACTUS_VERSION
-            TAG="$(tr -d '[:space:]' < CACTUS_VERSION)"
-          fi
-
-          if [ -z "$TAG" ]; then
-            echo "::error::Release tag is empty"
-            exit 1
-          fi
-
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Using release tag: $TAG"
-
-      - name: Find missing model bundles
-        id: missing
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.tag.outputs.tag }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          MODELS="
-          lfm2.5-350m-int4:LiquidAI/LFM2.5-350M
-          qwen3-1.7b-int4:Qwen/Qwen3-1.7B
-          lfm2-vl-450m-int4:LiquidAI/LFM2-VL-450M
-          lfm2.5-vl-1.6b-int4:LiquidAI/LFM2.5-VL-1.6B
-          nomic-embed-v2-int4:nomic-ai/nomic-embed-text-v2-moe
-          "
-
-          ASSETS="$(gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null || true)"
-
-          MISSING=""
-
-          for MODEL in $MODELS; do
-            ID="${MODEL%%:*}"
-            ASSET="${ID}-bundle.zip"
-
-            if ! printf '%s\n' "$ASSETS" | grep -Fxq "$ASSET"; then
-              MISSING="$MISSING $MODEL"
-            fi
-          done
-
-          MISSING="$(echo "$MISSING" | xargs)"
-
-          echo "list=$MISSING" >> "$GITHUB_OUTPUT"
-
-          if [ -n "$MISSING" ]; then
-            echo "any=true" >> "$GITHUB_OUTPUT"
-            echo "Missing bundles: $MISSING"
-          else
-            echo "any=false" >> "$GITHUB_OUTPUT"
-            echo "All model bundles already exist."
-          fi
-
-      - name: Install Python build environment
-        if: steps.missing.outputs.any == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          sudo apt-get update
-
-          sudo apt-get install -y \
-            python3.12 \
-            python3.12-venv \
-            cmake \
-            build-essential \
-            zip \
-            libcurl4-openssl-dev
-
-          python3.12 -m venv venv
-
-          venv/bin/pip install --upgrade pip
-
-          venv/bin/pip install -r python/requirements.txt
-
-          venv/bin/pip install -e python
-
-          venv/bin/pip install einops
-
-      - name: Create and upload missing model bundles
-        if: steps.missing.outputs.any == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.tag.outputs.tag }}
-          CACTUS_NO_CLOUD_TELE: "1"
-          HF_HUB_DISABLE_XET: "1"
-          HF_HUB_DISABLE_TELEMETRY: "1"
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          export PATH="$GITHUB_WORKSPACE/venv/bin:$PATH"
-
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" \
-              --title "$TAG" \
-              --target "$GITHUB_SHA" \
-              --notes "Automated NexVora ORBIT Android release."
-          fi
-
-          for MODEL in ${{ steps.missing.outputs.list }}; do
-            ID="${MODEL%%:*}"
-            HF_MODEL="${MODEL##*:}"
-
-            echo "::group::Transpiling $HF_MODEL"
-
-            python flutter/example/tools/transpile_model.py \
-              "$HF_MODEL" \
-              "weights/$ID" \
-              4
-
-            test -f "weights/$ID/components/manifest.json"
-
-            (
-              cd "weights/$ID"
-
-              zip -r -1 -q \
-                "$GITHUB_WORKSPACE/${ID}-bundle.zip" \
-                . \
-                -x '*.zip'
-            )
-
-            test -s "${ID}-bundle.zip"
-
-            gh release upload "$TAG" \
-              "${ID}-bundle.zip" \
-              --clobber
-
-            rm -rf "weights/$ID"
-            rm -f "${ID}-bundle.zip"
-            rm -rf ~/.cache/huggingface
-
-            echo "::endgroup::"
-          done
-
-  apk:
-    name: Build NexVora ORBIT ARM64 APK
-    needs: transpile
-    runs-on: ubuntu-24.04
-    timeout-minutes: 40
-
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Set up Java
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
       - name: Configure Android NDK
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ -z "${ANDROID_NDK_LATEST_HOME:-}" ]; then
-            echo "::error::ANDROID_NDK_LATEST_HOME is not available"
+          NDK="${ANDROID_NDK_LATEST_HOME:-}"
+
+          if [ -z "$NDK" ] && [ -n "${ANDROID_HOME:-}" ]; then
+            NDK="$(find "$ANDROID_HOME/ndk" \
+              -mindepth 1 -maxdepth 1 -type d \
+              2>/dev/null | sort -V | tail -n 1)"
+          fi
+
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+            echo "::error::Android NDK not found"
             exit 1
           fi
 
-          echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "Using Android NDK: $NDK"
 
-          echo "NDK: $ANDROID_NDK_LATEST_HOME"
-
-      - name: Install native build tools
+      - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build build-essential
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            build-essential \
+            curl \
+            zip \
+            unzip
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+          pub-cache: true
+
+      - name: Show build environment
+        run: |
+          flutter --version
+          java -version
+          cmake --version
+          echo "NDK: $ANDROID_NDK_HOME"
+
+      # --------------------------------------
+      # Build Cactus native FFI library
+      # --------------------------------------
 
       - name: Build Cactus native library
         shell: bash
@@ -223,120 +151,84 @@ jobs:
 
           bash flutter/example/native/build.sh
 
-      - name: Set up Flutter
-        uses: subosito/flutter-action@v2
+          test -s flutter/example/android/app/src/main/jniLibs/arm64-v8a/libcactus.so
+
+      # --------------------------------------
+      # Restore native build cache
+      # --------------------------------------
+
+      - name: Cache native build files
+        uses: actions/cache@v4
         with:
-          channel: stable
-          cache: true
+          path: |
+            ~/.cache/cactus-ffi
+            flutter/example/native/build
+            flutter/example/native_zim/build
+          key: orbit-native-${{ runner.os }}-${{ hashFiles('cactus/**', 'cactus-engine/**', 'flutter/example/native/**', 'flutter/example/native_zim/**') }}
+          restore-keys: |
+            orbit-native-${{ runner.os }}-
 
-      - name: Resolve release tag
-        id: tag
-        env:
-          EVENT_TAG: ${{ github.event.release.tag_name }}
-          INPUT_TAG: ${{ github.event.inputs.tag }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ -n "${EVENT_TAG:-}" ]; then
-            TAG="$EVENT_TAG"
-          elif [ -n "${INPUT_TAG:-}" ]; then
-            TAG="$INPUT_TAG"
-          else
-            TAG="$(tr -d '[:space:]' < CACTUS_VERSION)"
-          fi
-
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
-      - name: Configure release signing
-        env:
-          ORBIT_KEYSTORE_B64: ${{ secrets.ORBIT_KEYSTORE_B64 }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ -n "${ORBIT_KEYSTORE_B64:-}" ]; then
-            echo "$ORBIT_KEYSTORE_B64" \
-              | base64 --decode \
-              > "$RUNNER_TEMP/orbit-release.keystore"
-
-            echo "ORBIT_KEYSTORE_PATH=$RUNNER_TEMP/orbit-release.keystore" \
-              >> "$GITHUB_ENV"
-
-            echo "Release keystore configured."
-          else
-            echo "No release keystore secret. Build will use the project's default signing configuration."
-          fi
+      # --------------------------------------
+      # Build Android APK
+      # --------------------------------------
 
       - name: Get Flutter dependencies
         working-directory: flutter/example
         run: flutter pub get
 
-      - name: Build ARM64 release APK
+      - name: Build ARM64 Debug APK
         working-directory: flutter/example
-        env:
-          TAG: ${{ steps.tag.outputs.tag }}
-          ORBIT_KEYSTORE_PASSWORD: ${{ secrets.ORBIT_KEYSTORE_PASSWORD }}
         run: |
           set -euo pipefail
 
           flutter build apk \
-            --release \
-            --target-platform android-arm64 \
-            --dart-define=ORBIT_RELEASE_TAG="$TAG"
+            --debug \
+            --target-platform android-arm64
 
-      - name: Prepare APK and checksum
+          test -s build/app/outputs/flutter-apk/app-debug.apk
+
+      # --------------------------------------
+      # Prepare APK
+      # --------------------------------------
+
+      - name: Prepare APK artifact
         shell: bash
         run: |
           set -euo pipefail
-
-          APK="flutter/example/build/app/outputs/flutter-apk/app-release.apk"
-
-          if [ ! -s "$APK" ]; then
-            echo "::error::APK was not generated"
-            exit 1
-          fi
 
           mkdir -p dist
 
-          cp "$APK" dist/NexVora-ORBIT-arm64-v8a.apk
+          cp \
+            flutter/example/build/app/outputs/flutter-apk/app-debug.apk \
+            dist/NexVora-ORBIT-Debug-arm64-v8a.apk
 
           cd dist
 
-          sha256sum NexVora-ORBIT-arm64-v8a.apk \
-            > NexVora-ORBIT-arm64-v8a.apk.sha256
+          sha256sum NexVora-ORBIT-Debug-arm64-v8a.apk \
+            > NexVora-ORBIT-Debug-arm64-v8a.apk.sha256
 
           ls -lh
 
-      - name: Upload APK workflow artifact
+      # --------------------------------------
+      # Upload APK
+      # --------------------------------------
+
+      - name: Upload APK to GitHub Actions
         uses: actions/upload-artifact@v4
         with:
-          name: NexVora-ORBIT-ARM64-APK
+          name: NexVora-ORBIT-Debug-APK
           path: |
-            dist/NexVora-ORBIT-arm64-v8a.apk
-            dist/NexVora-ORBIT-arm64-v8a.apk.sha256
+            dist/NexVora-ORBIT-Debug-arm64-v8a.apk
+            dist/NexVora-ORBIT-Debug-arm64-v8a.apk.sha256
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish APK to GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.tag.outputs.tag }}
-        shell: bash
+      - name: Build summary
+        if: success()
         run: |
-          set -euo pipefail
-
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" \
-              --title "$TAG" \
-              --target "$GITHUB_SHA" \
-              --notes "Automated NexVora ORBIT Android release."
-          fi
-
-          gh release upload "$TAG" \
-            dist/NexVora-ORBIT-arm64-v8a.apk \
-            dist/NexVora-ORBIT-arm64-v8a.apk.sha256 \
-            --clobber
-
-          echo "APK successfully uploaded to release: $TAG"
-  
+          echo "## NexVora ORBIT Debug Build" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Status: SUCCESS" >> "$GITHUB_STEP_SUMMARY"
+          echo "Architecture: ARM64-v8a" >> "$GITHUB_STEP_SUMMARY"
+          echo "APK: NexVora-ORBIT-Debug-arm64-v8a.apk" >> "$GITHUB_STEP_SUMMARY"
+          
