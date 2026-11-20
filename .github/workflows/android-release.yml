@@ -1,19 +1,14 @@
-name: Android Binary Release
 
-# Builds the NexVora ORBIT Android app: transpiles any missing model bundles (cached as
-# release assets) and publishes the arm64-v8a APK to the GitHub release.
-#
-#  * release.published   -> attach the APK to the release being published
-#  * workflow_dispatch    -> manual run; creates the release if it does not exist
-#                            (tag defaults to the contents of CACTUS_VERSION)
+name: NexVora ORBIT Android Binary Release
 
 on:
   release:
     types: [published]
+
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to attach the binary to (created if missing). Defaults to CACTUS_VERSION."
+        description: "Release tag (default: CACTUS_VERSION)"
         required: false
         type: string
 
@@ -21,65 +16,114 @@ permissions:
   contents: write
 
 concurrency:
-  group: android-release-${{ github.ref }}
+  group: orbit-android-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   transpile:
-    # Produces the loadable model bundle. Transpilation builds the Cactus host
-    # runtime, whose NEON kernels only compile on ARM — so this MUST run on an
-    # arm64 runner. The bundle is cached as a release asset; subsequent runs
-    # skip the heavy transpile entirely.
+    name: Transpile Android Model Bundles
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
 
       - name: Resolve release tag
         id: tag
         env:
           EVENT_TAG: ${{ github.event.release.tag_name }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
+        shell: bash
         run: |
-          if [ -n "$EVENT_TAG" ]; then tag="$EVENT_TAG"
-          elif [ -n "$INPUT_TAG" ]; then tag="$INPUT_TAG"
-          else tag=$(tr -d '[:space:]' < CACTUS_VERSION); fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
 
-      # Catalog of models to host as release bundles: "<bundle-id>:<hf-model-id>".
-      # The app embeds the first (default) and downloads the rest on demand.
-      - name: Determine missing bundles
+          if [ -n "${EVENT_TAG:-}" ]; then
+            TAG="$EVENT_TAG"
+          elif [ -n "${INPUT_TAG:-}" ]; then
+            TAG="$INPUT_TAG"
+          else
+            test -f CACTUS_VERSION
+            TAG="$(tr -d '[:space:]' < CACTUS_VERSION)"
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "::error::Release tag is empty"
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Using release tag: $TAG"
+
+      - name: Find missing model bundles
         id: missing
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
+        shell: bash
         run: |
-          MODELS="lfm2.5-350m-int4:LiquidAI/LFM2.5-350M qwen3-1.7b-int4:Qwen/Qwen3-1.7B lfm2-vl-450m-int4:LiquidAI/LFM2-VL-450M lfm2.5-vl-1.6b-int4:LiquidAI/LFM2.5-VL-1.6B nomic-embed-v2-int4:nomic-ai/nomic-embed-text-v2-moe"
-          assets=$(gh release view "$TAG" 2>/dev/null || true)
-          missing=""
-          for m in $MODELS; do
-            id="${m%%:*}"
-            echo "$assets" | grep -q "${id}-bundle.zip" || missing="$missing $m"
+          set -euo pipefail
+
+          MODELS="
+          lfm2.5-350m-int4:LiquidAI/LFM2.5-350M
+          qwen3-1.7b-int4:Qwen/Qwen3-1.7B
+          lfm2-vl-450m-int4:LiquidAI/LFM2-VL-450M
+          lfm2.5-vl-1.6b-int4:LiquidAI/LFM2.5-VL-1.6B
+          nomic-embed-v2-int4:nomic-ai/nomic-embed-text-v2-moe
+          "
+
+          ASSETS="$(gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+
+          MISSING=""
+
+          for MODEL in $MODELS; do
+            ID="${MODEL%%:*}"
+            ASSET="${ID}-bundle.zip"
+
+            if ! printf '%s\n' "$ASSETS" | grep -Fxq "$ASSET"; then
+              MISSING="$MISSING $MODEL"
+            fi
           done
-          missing="$(echo $missing | xargs)"
-          echo "list=$missing" >> "$GITHUB_OUTPUT"
-          [ -n "$missing" ] && echo "any=true" >> "$GITHUB_OUTPUT" || echo "any=false" >> "$GITHUB_OUTPUT"
-          echo "Missing bundles: ${missing:-(none)}"
 
-      - name: Install Python toolchain
+          MISSING="$(echo "$MISSING" | xargs)"
+
+          echo "list=$MISSING" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$MISSING" ]; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+            echo "Missing bundles: $MISSING"
+          else
+            echo "any=false" >> "$GITHUB_OUTPUT"
+            echo "All model bundles already exist."
+          fi
+
+      - name: Install Python build environment
         if: steps.missing.outputs.any == 'true'
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y python3.12-venv cmake build-essential zip libcurl4-openssl-dev
-          python3.12 -m venv venv
-          venv/bin/pip install --upgrade pip -q
-          # arm64 PyPI serves CPU torch wheels by default.
-          venv/bin/pip install -r python/requirements.txt -q
-          venv/bin/pip install -e python -q
-          # nomic-embed (RAG embedder) remote modeling code needs einops.
-          venv/bin/pip install einops -q
+          set -euo pipefail
 
-      - name: Transpile missing bundles and upload to release
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            python3.12 \
+            python3.12-venv \
+            cmake \
+            build-essential \
+            zip \
+            libcurl4-openssl-dev
+
+          python3.12 -m venv venv
+
+          venv/bin/pip install --upgrade pip
+
+          venv/bin/pip install -r python/requirements.txt
+
+          venv/bin/pip install -e python
+
+          venv/bin/pip install einops
+
+      - name: Create and upload missing model bundles
         if: steps.missing.outputs.any == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -87,125 +131,212 @@ jobs:
           CACTUS_NO_CLOUD_TELE: "1"
           HF_HUB_DISABLE_XET: "1"
           HF_HUB_DISABLE_TELEMETRY: "1"
+        shell: bash
         run: |
           set -euo pipefail
+
           export PATH="$GITHUB_WORKSPACE/venv/bin:$PATH"
+
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --title "$TAG" --target "$GITHUB_SHA" \
-              --notes "Automated NexVora ORBIT Android build." || true
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --target "$GITHUB_SHA" \
+              --notes "Automated NexVora ORBIT Android release."
           fi
-          for m in ${{ steps.missing.outputs.list }}; do
-            id="${m%%:*}"; hf="${m##*:}"
-            echo "::group::Transpiling $hf -> $id"
-            python flutter/example/tools/transpile_model.py "$hf" "weights/$id" 4
-            test -f "weights/$id/components/manifest.json"
-            ( cd "weights/$id" && zip -r -1 -q "$GITHUB_WORKSPACE/${id}-bundle.zip" . -x '*.zip' )
-            gh release upload "$TAG" "${id}-bundle.zip" --clobber
-            # Free disk before the next (possibly multi-GB) model.
-            rm -rf "weights/$id" "${id}-bundle.zip" ~/.cache/huggingface
+
+          for MODEL in ${{ steps.missing.outputs.list }}; do
+            ID="${MODEL%%:*}"
+            HF_MODEL="${MODEL##*:}"
+
+            echo "::group::Transpiling $HF_MODEL"
+
+            python flutter/example/tools/transpile_model.py \
+              "$HF_MODEL" \
+              "weights/$ID" \
+              4
+
+            test -f "weights/$ID/components/manifest.json"
+
+            (
+              cd "weights/$ID"
+
+              zip -r -1 -q \
+                "$GITHUB_WORKSPACE/${ID}-bundle.zip" \
+                . \
+                -x '*.zip'
+            )
+
+            test -s "${ID}-bundle.zip"
+
+            gh release upload "$TAG" \
+              "${ID}-bundle.zip" \
+              --clobber
+
+            rm -rf "weights/$ID"
+            rm -f "${ID}-bundle.zip"
+            rm -rf ~/.cache/huggingface
+
             echo "::endgroup::"
           done
 
   apk:
-    # Builds the Flutter demo chat app into an installable APK and attaches it to
-    # the release. The model bundle is produced by the `transpile` job and
-    # fetched from the release here (the APK build cross-compiles fine on x86).
+    name: Build NexVora ORBIT ARM64 APK
     needs: transpile
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
 
       - name: Configure Android NDK
+        shell: bash
         run: |
+          set -euo pipefail
+
           if [ -z "${ANDROID_NDK_LATEST_HOME:-}" ]; then
-            echo "::error::ANDROID_NDK_LATEST_HOME is not set on this runner"
+            echo "::error::ANDROID_NDK_LATEST_HOME is not available"
             exit 1
           fi
+
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
 
-      - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+          echo "NDK: $ANDROID_NDK_LATEST_HOME"
 
-      - name: Build FFI libcactus.so into jniLibs
-        run: bash flutter/example/native/build.sh
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build build-essential
 
-      - uses: subosito/flutter-action@v2
+      - name: Build Cactus native library
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chmod +x flutter/example/native/build.sh
+
+          bash flutter/example/native/build.sh
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
         with:
           channel: stable
+          cache: true
 
       - name: Resolve release tag
         id: tag
         env:
           EVENT_TAG: ${{ github.event.release.tag_name }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
+        shell: bash
         run: |
-          if [ -n "$EVENT_TAG" ]; then
-            tag="$EVENT_TAG"
-          elif [ -n "$INPUT_TAG" ]; then
-            tag="$INPUT_TAG"
+          set -euo pipefail
+
+          if [ -n "${EVENT_TAG:-}" ]; then
+            TAG="$EVENT_TAG"
+          elif [ -n "${INPUT_TAG:-}" ]; then
+            TAG="$INPUT_TAG"
           else
-            tag=$(tr -d '[:space:]' < CACTUS_VERSION)
+            TAG="$(tr -d '[:space:]' < CACTUS_VERSION)"
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      # No model is bundled into the APK — the app downloads models (including
-      # the default) from the GitHub release on demand to keep the APK small.
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      # Stable release signing: decode the shared keystore so every published
-      # APK is signed with the same key and updates installs in place. Skipped
-      # (debug signing) when the secrets are absent, e.g. on forks.
-      - name: Set up release keystore
+      - name: Configure release signing
         env:
           ORBIT_KEYSTORE_B64: ${{ secrets.ORBIT_KEYSTORE_B64 }}
+        shell: bash
         run: |
-          if [ -n "$ORBIT_KEYSTORE_B64" ]; then
-            echo "$ORBIT_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/orbit-release.keystore"
-            echo "ORBIT_KEYSTORE_PATH=$RUNNER_TEMP/orbit-release.keystore" >> "$GITHUB_ENV"
-            echo "Release keystore installed."
+          set -euo pipefail
+
+          if [ -n "${ORBIT_KEYSTORE_B64:-}" ]; then
+            echo "$ORBIT_KEYSTORE_B64" \
+              | base64 --decode \
+              > "$RUNNER_TEMP/orbit-release.keystore"
+
+            echo "ORBIT_KEYSTORE_PATH=$RUNNER_TEMP/orbit-release.keystore" \
+              >> "$GITHUB_ENV"
+
+            echo "Release keystore configured."
           else
-            echo "No keystore secret — APK will be debug-signed."
+            echo "No release keystore secret. Build will use the project's default signing configuration."
           fi
 
-      - name: Build APK
+      - name: Get Flutter dependencies
+        working-directory: flutter/example
+        run: flutter pub get
+
+      - name: Build ARM64 release APK
         working-directory: flutter/example
         env:
           TAG: ${{ steps.tag.outputs.tag }}
           ORBIT_KEYSTORE_PASSWORD: ${{ secrets.ORBIT_KEYSTORE_PASSWORD }}
         run: |
-          flutter pub get
-          # The baked-in tag powers the in-app "new version available" banner.
-          flutter build apk --release --target-platform android-arm64 \
+          set -euo pipefail
+
+          flutter build apk \
+            --release \
+            --target-platform android-arm64 \
             --dart-define=ORBIT_RELEASE_TAG="$TAG"
 
-      - name: Stage APK
+      - name: Prepare APK and checksum
+        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
-          cp flutter/example/build/app/outputs/flutter-apk/app-release.apk \
-             dist/nexvora-orbit-arm64-v8a.apk
-          ( cd dist && sha256sum nexvora-orbit-arm64-v8a.apk > nexvora-orbit-arm64-v8a.apk.sha256 )
-          ls -lh dist
 
-      - name: Upload workflow artifact
+          APK="flutter/example/build/app/outputs/flutter-apk/app-release.apk"
+
+          if [ ! -s "$APK" ]; then
+            echo "::error::APK was not generated"
+            exit 1
+          fi
+
+          mkdir -p dist
+
+          cp "$APK" dist/NexVora-ORBIT-arm64-v8a.apk
+
+          cd dist
+
+          sha256sum NexVora-ORBIT-arm64-v8a.apk \
+            > NexVora-ORBIT-arm64-v8a.apk.sha256
+
+          ls -lh
+
+      - name: Upload APK workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nexvora-orbit-apk
-          path: dist/nexvora-orbit-arm64-v8a.apk*
+          name: NexVora-ORBIT-ARM64-APK
+          path: |
+            dist/NexVora-ORBIT-arm64-v8a.apk
+            dist/NexVora-ORBIT-arm64-v8a.apk.sha256
           if-no-files-found: error
+          retention-days: 30
 
-      - name: Publish APK to GitHub release
+      - name: Publish APK to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
+        shell: bash
         run: |
           set -euo pipefail
+
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --title "$TAG" --target "$GITHUB_SHA" \
-              --notes "Automated NexVora ORBIT Android build." || true
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --target "$GITHUB_SHA" \
+              --notes "Automated NexVora ORBIT Android release."
           fi
+
           gh release upload "$TAG" \
-            dist/nexvora-orbit-arm64-v8a.apk \
-            dist/nexvora-orbit-arm64-v8a.apk.sha256 \
+            dist/NexVora-ORBIT-arm64-v8a.apk \
+            dist/NexVora-ORBIT-arm64-v8a.apk.sha256 \
             --clobber
-          echo "Uploaded APK to release $TAG"
+
+          echo "APK successfully uploaded to release: $TAG"
+  
