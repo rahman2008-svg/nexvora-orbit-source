@@ -1,0 +1,3 @@
+NexVora ORBIT - Your Phone. Your Intelligence.
+
+On-device Qwen3 assistant with offline voice, app discovery and confirmed, typed phone actions. No account, no cloud.

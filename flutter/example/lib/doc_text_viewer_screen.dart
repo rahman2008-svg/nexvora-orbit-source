@@ -1,0 +1,269 @@
+import 'package:flutter/material.dart';
+
+import 'app_prefs.dart';
+
+/// Shows a document's extracted text, scrolled to and highlighting the cited
+/// passage — the non-PDF equivalent of opening a PDF at its page. Used for
+/// Word/PowerPoint/Excel/EPUB/text citations, which have no native paginated
+/// viewer but whose extracted text we keep in the corpus.
+///
+/// To stay instant even on a large book, it renders a generous window of text
+/// around the quote rather than the whole document.
+class DocTextViewerScreen extends StatefulWidget {
+  const DocTextViewerScreen({
+    super.key,
+    required this.title,
+    required this.fullText,
+    required this.snippet,
+    this.resumeKey,
+  });
+
+  final String title;
+  final String fullText;
+  final String snippet;
+  // When set (and there's no quote to jump to), remembers and resumes the
+  // scroll position so reading picks up where it was left.
+  final String? resumeKey;
+
+  @override
+  State<DocTextViewerScreen> createState() => _DocTextViewerScreenState();
+}
+
+class _DocTextViewerScreenState extends State<DocTextViewerScreen> {
+  static const int _window = 8000; // chars of context on each side of the quote
+
+  final GlobalKey _highlightKey = GlobalKey();
+  final ScrollController _scroll = ScrollController();
+  late final _Located _loc;
+
+  @override
+  void initState() {
+    super.initState();
+    _loc = _locate(widget.fullText, widget.snippet);
+    if (_loc.found) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final ctx = _highlightKey.currentContext;
+        if (ctx != null) {
+          Scrollable.ensureVisible(ctx,
+              alignment: 0.12, duration: const Duration(milliseconds: 350));
+        }
+      });
+    } else if (widget.resumeKey != null) {
+      // No quote to jump to: resume the last scroll position and keep it saved.
+      WidgetsBinding.instance.addPostFrameCallback((_) => _restoreScroll());
+      _scroll.addListener(_onScroll);
+    }
+  }
+
+  int _progress = 0; // percent read, shown in the app bar
+
+  /// Restores the saved fraction, retrying while the document is still laying
+  /// out (maxScrollExtent is 0 until the long text has been measured).
+  Future<void> _restoreScroll() async {
+    final frac = await loadDocScroll(widget.resumeKey!);
+    if (frac == null || frac <= 0) return;
+    for (var attempt = 0; attempt < 20 && mounted; attempt++) {
+      if (_scroll.hasClients && _scroll.position.maxScrollExtent > 0) {
+        final max = _scroll.position.maxScrollExtent;
+        _scroll.jumpTo((frac * max).clamp(0, max));
+        setState(() => _progress = (frac * 100).clamp(0, 100).round());
+        return;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+  }
+
+  void _onScroll() {
+    if (!_scroll.hasClients) return;
+    final max = _scroll.position.maxScrollExtent;
+    if (max <= 0) return;
+    final frac = (_scroll.offset / max).clamp(0.0, 1.0);
+    final pct = (frac * 100).round();
+    if (pct != _progress) {
+      setState(() => _progress = pct);
+      saveDocScroll(widget.resumeKey!, frac);
+    }
+  }
+
+  @override
+  void dispose() {
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  /// Finds the quote in [text] with a whitespace-tolerant match on its leading
+  /// and trailing words (the chunker may have re-joined lines), and returns the
+  /// character window to render plus the highlight range within it.
+  _Located _locate(String text, String snippet) {
+    if (text.isEmpty) return const _Located.empty();
+    // E-reader mode (no quote to find): render the whole document so it can be
+    // read end to end and the scroll position resumed.
+    if (snippet.trim().isEmpty) {
+      return _Located(
+        found: false,
+        before: text,
+        highlight: '',
+        after: '',
+        leadingEllipsis: false,
+        trailingEllipsis: false,
+      );
+    }
+    final words = snippet
+        .trim()
+        .split(RegExp(r'\s+'))
+        .where((w) => w.isNotEmpty)
+        .toList();
+    int start = -1, end = -1;
+    if (words.length >= 2) {
+      final head = RegExp(
+          words.take(12).map(RegExp.escape).join(r'\s+'),
+          caseSensitive: false, dotAll: true);
+      final hm = head.firstMatch(text);
+      if (hm != null) {
+        start = hm.start;
+        // Locate the tail after the head to bound the highlight precisely.
+        final tailWords = words.length > 12 ? words.sublist(words.length - 8) : words;
+        final tail = RegExp(tailWords.map(RegExp.escape).join(r'\s+'),
+            caseSensitive: false, dotAll: true);
+        final tm = tail.firstMatch(text.substring(start));
+        end = tm != null
+            ? start + tm.end
+            : (start + snippet.length).clamp(start, text.length);
+      }
+    }
+    if (start < 0) {
+      // No reliable match — show the start of the document, no highlight.
+      final winEnd = text.length < _window * 2 ? text.length : _window * 2;
+      return _Located(
+        found: false,
+        before: text.substring(0, winEnd),
+        highlight: '',
+        after: '',
+        leadingEllipsis: false,
+        trailingEllipsis: winEnd < text.length,
+      );
+    }
+    final winStart = (start - _window) < 0 ? 0 : start - _window;
+    final winEnd = (end + _window) > text.length ? text.length : end + _window;
+    return _Located(
+      found: true,
+      before: text.substring(winStart, start),
+      highlight: text.substring(start, end),
+      after: text.substring(end, winEnd),
+      leadingEllipsis: winStart > 0,
+      trailingEllipsis: winEnd < text.length,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final base = Theme.of(context).textTheme.bodyMedium;
+    if (widget.fullText.trim().isEmpty) {
+      return Scaffold(
+        appBar: AppBar(title: Text(widget.title, maxLines: 1, overflow: TextOverflow.ellipsis)),
+        body: const Center(
+          child: Padding(
+            padding: EdgeInsets.all(24),
+            child: Text(
+              "The extracted text for this document isn't available anymore. "
+              'Re-scan to refresh it.',
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ),
+      );
+    }
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+        bottom: (widget.resumeKey != null && !_loc.found)
+            ? PreferredSize(
+                preferredSize: const Size.fromHeight(22),
+                child: Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: Text('$_progress% read',
+                      style: Theme.of(context).textTheme.labelSmall),
+                ),
+              )
+            : null,
+      ),
+      body: Column(
+        children: [
+          if (!_loc.found)
+            Material(
+              color: scheme.secondaryContainer,
+              child: const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                child: Text(
+                  "Couldn't pinpoint the exact quote — showing the document.",
+                  style: TextStyle(fontSize: 12),
+                ),
+              ),
+            ),
+          Expanded(
+            child: SingleChildScrollView(
+              controller: _scroll,
+              padding: const EdgeInsets.all(16),
+              child: SelectableText.rich(
+                TextSpan(
+                  style: base,
+                  children: [
+                    if (_loc.leadingEllipsis)
+                      const TextSpan(text: '…\n\n'),
+                    TextSpan(text: _loc.before),
+                    if (_loc.highlight.isNotEmpty)
+                      WidgetSpan(
+                        alignment: PlaceholderAlignment.baseline,
+                        baseline: TextBaseline.alphabetic,
+                        child: Container(
+                          key: _highlightKey,
+                          decoration: BoxDecoration(
+                            color: scheme.tertiaryContainer,
+                            borderRadius: BorderRadius.circular(3),
+                          ),
+                          child: Text(_loc.highlight,
+                              style: base?.copyWith(
+                                  color: scheme.onTertiaryContainer,
+                                  fontWeight: FontWeight.w500)),
+                        ),
+                      ),
+                    TextSpan(text: _loc.after),
+                    if (_loc.trailingEllipsis)
+                      const TextSpan(text: '\n\n…'),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// The rendered window: text before the quote, the quote itself, and text after.
+class _Located {
+  const _Located({
+    required this.found,
+    required this.before,
+    required this.highlight,
+    required this.after,
+    required this.leadingEllipsis,
+    required this.trailingEllipsis,
+  });
+  const _Located.empty()
+      : found = false,
+        before = '',
+        highlight = '',
+        after = '',
+        leadingEllipsis = false,
+        trailingEllipsis = false;
+
+  final bool found;
+  final String before;
+  final String highlight;
+  final String after;
+  final bool leadingEllipsis;
+  final bool trailingEllipsis;
+}

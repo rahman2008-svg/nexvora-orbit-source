@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Splash shown while the Flutter engine starts: ORBIT centered on #080A14. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/orbit_bg" />
+    <item>
+        <bitmap
+            android:gravity="center"
+            android:src="@drawable/launch_orbit" />
+    </item>
+</layer-list>

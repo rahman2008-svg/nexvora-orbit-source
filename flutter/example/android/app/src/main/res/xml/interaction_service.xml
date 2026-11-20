@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Declares ORBIT as a voice-interaction (assistant) app. supportsAssist routes
+     assist invocations (power-button hold, assist gesture, lock screen) to
+     OrbitVoiceInteractionSession. -->
+<voice-interaction-service
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:sessionService="com.nexvora.orbit.OrbitVoiceInteractionSessionService"
+    android:recognitionService="com.nexvora.orbit.OrbitRecognitionService"
+    android:supportsAssist="true"
+    android:supportsLaunchVoiceAssistFromKeyguard="true"
+    android:supportsLocalInteraction="true" />

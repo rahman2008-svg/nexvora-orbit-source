@@ -1,0 +1,82 @@
+name: CI
+
+# Static analysis, formatting, unit tests and a debug APK on every push / PR.
+# The release workflow (android-release.yml) publishes the signed APK as a
+# directly downloadable GitHub release asset.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: flutter/example
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: System SQLite (host tests use sqlite3 via FFI)
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+        working-directory: .
+      - run: flutter pub get
+      - name: Format check (new ORBIT code only)
+        run: dart format --output=none --set-exit-if-changed lib/orbit test/orbit_actions_test.dart
+      - name: Analyze
+        run: flutter analyze
+      - name: Unit tests
+        run: flutter test
+
+  apk-debug:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Android NDK
+        run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+      - run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+      - name: Build FFI libcactus.so into jniLibs
+        run: bash flutter/example/native/build.sh
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('flutter/example/android/**/*.gradle*', 'flutter/example/pubspec.lock') }}
+      - name: Build debug APK
+        working-directory: flutter/example
+        run: |
+          flutter pub get
+          flutter build apk --debug --target-platform android-arm64
+      - name: Stage APK
+        run: |
+          mkdir -p dist
+          cp flutter/example/build/app/outputs/flutter-apk/app-debug.apk dist/nexvora-orbit-debug-arm64-v8a.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexvora-orbit-debug-apk
+          path: dist/nexvora-orbit-debug-arm64-v8a.apk
+          if-no-files-found: error
