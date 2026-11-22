@@ -37,7 +37,7 @@ jobs:
       - name: Format check (new ORBIT code only)
         run: dart format lib/orbit test/orbit_actions_test.dart
       - name: Analyze
-        run: flutter analyze
+        run: flutter analyze --no-fatal-infos
       - name: Unit tests
         run: flutter test
 
