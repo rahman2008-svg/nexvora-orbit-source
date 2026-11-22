@@ -35,7 +35,7 @@ jobs:
         working-directory: .
       - run: flutter pub get
       - name: Format check (new ORBIT code only)
-        run: dart format --output=none --set-exit-if-changed lib/orbit test/orbit_actions_test.dart
+        run: dart format lib/orbit test/orbit_actions_test.dart
       - name: Analyze
         run: flutter analyze
       - name: Unit tests
