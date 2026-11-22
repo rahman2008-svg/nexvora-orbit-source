@@ -5,9 +5,7 @@ on:
   push:
     branches:
       - main
-
   pull_request:
-
   workflow_dispatch:
 
 permissions:
@@ -18,11 +16,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-
-  # ------------------------------------------
-  # JOB 1: FORMAT, ANALYZE AND TEST
-  # ------------------------------------------
-
   test:
     name: Format, Analyze and Test
     runs-on: ubuntu-24.04
@@ -33,7 +26,6 @@ jobs:
         working-directory: flutter/example
 
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -49,7 +41,7 @@ jobs:
           flutter --version
           dart --version
 
-      - name: Install system SQLite dependencies
+      - name: Install SQLite dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev
@@ -58,11 +50,8 @@ jobs:
       - name: Get Flutter dependencies
         run: flutter pub get
 
-      # Format source automatically in GitHub Runner.
-      # No Dart installation is required on the user's phone.
       - name: Format ORBIT Dart source
-        run: |
-          dart format lib/orbit test/orbit_actions_test.dart
+        run: dart format lib/orbit test/orbit_actions_test.dart
 
       - name: Analyze Flutter project
         run: flutter analyze
@@ -70,19 +59,16 @@ jobs:
       - name: Run Flutter unit tests
         run: flutter test
 
-  # ------------------------------------------
-  # JOB 2: BUILD ANDROID DEBUG APK
-  # ------------------------------------------
-
   apk-debug:
     name: Build NexVora ORBIT ARM64 Debug APK
     needs: test
-
     runs-on: ubuntu-24.04
     timeout-minutes: 90
 
-    steps:
+    permissions:
+      contents: write
 
+    steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -117,12 +103,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            cmake \
-            ninja-build \
-            build-essential \
-            curl \
-            zip \
-            unzip
+            cmake ninja-build build-essential curl zip unzip
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -138,26 +119,7 @@ jobs:
           cmake --version
           echo "NDK: $ANDROID_NDK_HOME"
 
-      # --------------------------------------
-      # Build Cactus native FFI library
-      # --------------------------------------
-
-      - name: Build Cactus native library
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          chmod +x flutter/example/native/build.sh
-
-          bash flutter/example/native/build.sh
-
-          test -s flutter/example/android/app/src/main/jniLibs/arm64-v8a/libcactus.so
-
-      # --------------------------------------
-      # Restore native build cache
-      # --------------------------------------
-
-      - name: Cache native build files
+      - name: Restore native build cache
         uses: actions/cache@v4
         with:
           path: |
@@ -168,9 +130,13 @@ jobs:
           restore-keys: |
             orbit-native-${{ runner.os }}-
 
-      # --------------------------------------
-      # Build Android APK
-      # --------------------------------------
+      - name: Build Cactus native library
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x flutter/example/native/build.sh
+          bash flutter/example/native/build.sh
+          test -s flutter/example/android/app/src/main/jniLibs/arm64-v8a/libcactus.so
 
       - name: Get Flutter dependencies
         working-directory: flutter/example
@@ -180,22 +146,15 @@ jobs:
         working-directory: flutter/example
         run: |
           set -euo pipefail
-
           flutter build apk \
             --debug \
             --target-platform android-arm64
-
           test -s build/app/outputs/flutter-apk/app-debug.apk
 
-      # --------------------------------------
-      # Prepare APK
-      # --------------------------------------
-
-      - name: Prepare APK artifact
+      - name: Prepare APK
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p dist
 
           cp \
@@ -203,15 +162,10 @@ jobs:
             dist/NexVora-ORBIT-Debug-arm64-v8a.apk
 
           cd dist
-
           sha256sum NexVora-ORBIT-Debug-arm64-v8a.apk \
             > NexVora-ORBIT-Debug-arm64-v8a.apk.sha256
 
           ls -lh
-
-      # --------------------------------------
-      # Upload APK
-      # --------------------------------------
 
       - name: Upload APK to GitHub Actions
         uses: actions/upload-artifact@v4
@@ -223,12 +177,28 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Publish APK to GitHub Public Release
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: orbit-build-${{ github.run_number }}-${{ github.run_attempt }}
+          name: NexVora ORBIT Build ${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            dist/NexVora-ORBIT-Debug-arm64-v8a.apk
+            dist/NexVora-ORBIT-Debug-arm64-v8a.apk.sha256
+          generate_release_notes: true
+          make_latest: true
+          fail_on_unmatched_files: true
+
       - name: Build summary
         if: success()
         run: |
           echo "## NexVora ORBIT Debug Build" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Status: SUCCESS" >> "$GITHUB_STEP_SUMMARY"
           echo "Architecture: ARM64-v8a" >> "$GITHUB_STEP_SUMMARY"
           echo "APK: NexVora-ORBIT-Debug-arm64-v8a.apk" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            echo "Direct APK: https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/NexVora-ORBIT-Debug-arm64-v8a.apk" >> "$GITHUB_STEP_SUMMARY"
+          fi
           
