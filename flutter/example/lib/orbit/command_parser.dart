@@ -138,7 +138,7 @@ class CommandParser {
 
     // "open my music app" – a category/capability word, not a name.
     final generic = RegExp(r'^(music|video|photo|photos|pdf|notes?|note|browser|email|mail)(?:\s+(?:player|reader|app|application))?$').firstMatch(target);
-    if (generic != null && index.findByName(target).isEmpty) {
+    if (generic != null) {
       return _choose(generic.group(1)!, capability: true);
     }
 
